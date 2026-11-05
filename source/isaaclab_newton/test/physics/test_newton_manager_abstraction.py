@@ -179,7 +179,7 @@ def test_deterministic_collision_pipeline_matches_expanded_contact_capacity(coll
         def prepare_contacts(cls, cfg, solver, contacts, pipeline):
             prepared.append(contacts)
 
-    solver = SimpleNamespace(model=SimpleNamespace(body_variant_count=0), get_max_contact_count=lambda: 2)
+    solver = SimpleNamespace(model=SimpleNamespace(), get_max_contact_count=lambda: 2)
     solver_cfg = NewtonSolverCfg(class_type=RecordingSolver)
     backend = backend_stub(
         cfg=NewtonCfg(collision_cfg=collision_cfg, solver_cfg=solver_cfg),
@@ -197,34 +197,6 @@ def test_deterministic_collision_pipeline_matches_expanded_contact_capacity(coll
     assert pipeline_calls[0]["deterministic"] is True
     assert backend.contacts.rigid_contact_max == 2
     assert prepared == [backend.contacts]
-
-
-def _array(values) -> SimpleNamespace:
-    return SimpleNamespace(numpy=lambda: np.asarray(values))
-
-
-@pytest.mark.parametrize(
-    "world_count, shape_world, starts, ranges, body_world, expected",
-    [
-        # A ground shared by both worlds, a body in world 0 with a one- and a two-shape variant, and a shared body:
-        # world 0 holds 4 colliders, world 1 holds 2, and the 2 shared ones pair among themselves.
-        (2, [-1, 0, 0, 0, -1], [0, 2, 3], [[1, 2], [2, 4], [4, 5]], [0, -1], 6 + 1 + 1),
-        # A single one-shape variant pairs with nothing, but the broad phase needs room for a pair.
-        (1, [0], [0, 1], [[0, 1]], [0], 1),
-    ],
-)
-def test_body_variant_pair_bound(world_count, shape_world, starts, ranges, body_world, expected):
-    """The bound counts shared variant bodies in every world and stays positive."""
-    model = SimpleNamespace(
-        shape_flags=_array(np.full(len(shape_world), int(newton_backend.ShapeFlags.COLLIDE_SHAPES))),
-        shape_world=_array(shape_world),
-        body_variant_start=_array(starts),
-        _body_variant_shape_range=_array(ranges),
-        body_world=_array(body_world),
-        world_count=world_count,
-        shape_count=len(shape_world),
-    )
-    assert newton_backend._body_variant_shape_pairs_max(model) == expected
 
 
 @pytest.mark.parametrize("cloth", [False, True])
