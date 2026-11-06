@@ -159,6 +159,7 @@ class NewtonManager(PhysicsManager):
         if dispatch_stop:
             self.dispatch_event(PhysicsEvent.STOP)
         self.views.clear()
+        self._scene_data_backend.close_model()
         self.backend = None
         SimulationContext.instance().close_backend(backend)
 
@@ -347,6 +348,17 @@ class NewtonManager(PhysicsManager):
             attr: Contact attribute name.
         """
         self.builder.request_contact_attributes(attr)
+
+    def select_body_variants(self, variants: wp.array, bodies: wp.array) -> None:
+        """Select the variants of bodies, for the solver, the renderers and the Newton model's other consumers.
+
+        Args:
+            variants: Index of the variant to select for each body.
+            bodies: Model indices of the bodies.
+        """
+        self.add_model_change(self.backend.model.select_body_variants(variants, bodies=bodies))
+        self.backend.variants_version += 1
+        self._mark_transforms_changed()
 
     def add_model_change(self, change: ModelFlags) -> None:
         """Register a model change to notify the solver at the next step."""
