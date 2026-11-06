@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
+from mujoco_warp import OverflowType
 from newton import Contacts, Model, State
 from newton.solvers import SolverMuJoCo
 
@@ -24,6 +25,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SENSORS_BY_STATE_ATTRIBUTE = {"body_qdd": "the IMU or PVA sensor", "body_parent_f": "the joint-wrench sensor"}
+
+_WORLD_OVERFLOWS = int(OverflowType.NEFC | OverflowType.NJMAX_NNZ)
+"""The ``njmax`` capacity overflows, whose excess constraints MuJoCo Warp drops from that world's solve.
+
+The other bits are not faults here: BROADPHASE and NARROWPHASE flag every world when the shared contact buffer
+overflows, and the rest are per-world collision, sensor and solver-iteration diagnostics.
+"""
+
+
+@wp.kernel(enable_backward=False)
+def _flag_overflowed_worlds(overflow: wp.array(dtype=wp.int32), flags: int, faulted: wp.array(dtype=wp.bool)):
+    """Flag the worlds whose MuJoCo Warp overflow bitmask has any of ``flags`` set."""
+    world = wp.tid()
+    if overflow[world] & flags:
+        faulted[world] = True
 
 
 class MJWarpSolver(NewtonSolver):
@@ -123,6 +139,25 @@ class MJWarpSolver(NewtonSolver):
         logger.info(f"Solver convergence data: {data}")
         if np.max(niter) == solver.mjw_model.opt.iterations:
             logger.warning(f"Solver didn't converge! max_iter={np.max(niter)}")
+
+    @classmethod
+    def flag_faulted_worlds(cls, cfg: MJWarpSolverCfg, solver: SolverMuJoCo, faulted: wp.array) -> None:
+        """Flag the worlds whose constraints overflowed their ``njmax`` capacity in the last substep, which MuJoCo Warp
+        drops from the solve of their world.
+
+        Newton zeroes the per-world overflow bitmask before every MuJoCo Warp step, so it describes the last substep
+        only. MuJoCo on the CPU does not report overflows.
+        """
+        if cfg.use_mujoco_cpu:
+            return
+        overflow = solver.mjw_data.overflow
+        wp.launch(
+            _flag_overflowed_worlds,
+            dim=len(overflow),
+            inputs=[overflow, _WORLD_OVERFLOWS],
+            outputs=[faulted],
+            device=overflow.device,
+        )
 
     @classmethod
     def fixed_tendon_control(cls, cfg: MJWarpSolverCfg, articulation, model: Model) -> MjWarpTendonControl | None:
