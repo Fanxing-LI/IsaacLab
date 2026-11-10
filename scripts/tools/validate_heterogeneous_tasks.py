@@ -3,101 +3,564 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Check through the heterogeneous task manager that the objects of every task rest stably at their start poses.
+"""Evaluate a pi0.5 policy on the heterogeneous tasks, with the trials scheduled over the environments.
 
-Runs the heterogeneous VLA environment without cameras. In batches of ``--num_envs``, the task manager assigns one task
-per environment, the environments are reset, and the arm is held at its default pose for ``--seconds`` while the
-environments step without automatic resets. A task fails when an object on the furniture moves more than 3 cm, tilts
-more than 20 degrees, is not finite, or when the task succeeds at once. An object that starts in a container to be
-taken out may settle in it on its side and move up to 5 cm. Writes the failing task names to ``--output`` (JSON).
+Every environment of the heterogeneous VLA environment is a slot that can run any task. Each task gets ``--trials``
+trials. Idle slots take the pending trials with the longest time limits first, so the long trials do not run alone at
+the end. The slots are synchronized: every ``--horizon`` steps, all slots that run a trial are queried in one batch
+from the pi0.5 DROID joint-position policy that RoboLab's ``policy_server.py`` serves at ``--policy`` (openpi's
+WebSocket protocol), with both cameras letterboxed into 224 x 224, the arm joint positions, the gripper opening and
+the task's instruction. The answered joint targets and gripper commands are executed open loop. A trial ends on its
+task's success or time-out; its slot then holds its last targets and starts its next trial at the next query, where
+the task manager sets the slot's task and the slot is reset. A slot with a physics fault is reset at once and its
+trial runs again later, until it has faulted ``--max_faults`` times. A trial that ends within two steps is restarted
+at the next query instead of counted.
+
+Writes to the new directory ``--output``: ``result.json`` (the results of every task, the accounting of the schedule
+and the time of every phase; saved every ten seconds and when the run ends or fails) and ``episodes.jsonl`` (one line
+per finished trial). The protocol needs ``msgpack``.
 
 .. code-block:: bash
 
-    ./isaaclab.sh -p scripts/tools/validate_heterogeneous_tasks.py --num_envs 128 --output failed.json
+    uv run --with msgpack python scripts/tools/validate_heterogeneous_tasks.py --policy localhost:18013 \\
+        --num_envs 32 --trials 2 --output logs/heterogeneous_tasks/pi05
 """
 
 import argparse
 import json
-import math
+import statistics
+import time
+import traceback
+from collections import Counter, deque
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from isaaclab.app import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument("--task", default="IsaacContrib-VLA-Heterogeneous-Franka")
-parser.add_argument("--num_envs", type=int, default=128)
-parser.add_argument("--seconds", type=float, default=3.0)
-parser.add_argument("--output", required=True)
+parser.add_argument("--num_envs", type=int, default=32, help="Number of slots.")
+parser.add_argument("--policy", required=True, metavar="HOST:PORT", help="Address of the policy server.")
+parser.add_argument("--output", required=True, help="Directory of the results, which must not exist.")
+parser.add_argument("--tasks", nargs="+", metavar="NAME", help="Tasks to evaluate (default: all).")
+parser.add_argument("--trials", type=int, default=1, help="Trials per task.")
+parser.add_argument("--horizon", type=int, default=15, help="Steps executed per policy query.")
+parser.add_argument("--seed", type=int, default=0, help="Run seed of the policy's sampling noise.")
+parser.add_argument("--max_faults", type=int, default=3, help="Physics faults after which a trial fails for good.")
+parser.add_argument("--max_steps", type=int, default=100000, help="Environment steps after which the run fails.")
 parser.add_argument("--mesh_cache_dir", default=None, help="Directory of Newton's mesh cache, shared across runs.")
 add_launcher_args(parser)
 args = parser.parse_args()
+if args.tasks and len(set(args.tasks)) != len(args.tasks):
+    parser.error("--tasks must not repeat a task")
+if min(args.trials, args.horizon, args.max_faults) < 1:
+    parser.error("--trials, --horizon and --max_faults must be at least 1")
 
 import gymnasium as gym  # noqa: E402
 import newton  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from PIL import Image  # noqa: E402
 
 import isaaclab_tasks  # noqa: E402, F401
-from isaaclab_tasks.contrib.heterogeneous_tasks import mdp  # noqa: E402
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg  # noqa: E402
 
-if args.mesh_cache_dir:
-    newton.config.cache_dir_meshes = args.mesh_cache_dir
-env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
-for cfg in (env_cfg, *(env_cfg.tasks or {}).values()):
-    for name in ("over_shoulder_left_camera", "wrist_cam"):
-        setattr(cfg.scene, name, None)
-        setattr(cfg.observations.policy, name, None)
+CAMERAS = ("over_shoulder_left_camera", "wrist_cam")
+POLICY_IMAGE = 224
+"""Side of the square images the pi0.5 DROID checkpoint takes; the camera images are letterboxed into them."""
 
-with launch_simulation(env_cfg, args):
-    env = gym.make(args.task, cfg=env_cfg).unwrapped
-    manager = env.task_manager
-    names = manager.task_names
-    # Slot 0 holds the furniture; the others hold the objects on it.
-    slots = [name for name in env.scene.rigid_objects if name.startswith("object_") and name != "object_0"]
-    # The object each take-out task starts in a container, by slot.
-    taken_out = {
-        task: slots.index(term.params["objects"][0].name)
-        for task, term in manager.task_terms("success").items()
-        if term.func is mdp.object_outside_of
-    }
-    robot = env.scene["robot"]
-    hold = torch.cat((robot.data.default_joint_pos.torch[:, :7], torch.ones(env.num_envs, 1, device=env.device)), 1)
-    steps = math.ceil(args.seconds / env.step_dt)
-    failed, report = [], {}
-    for start in range(0, len(names), env.num_envs):
-        tasks = torch.arange(start, min(start + env.num_envs, len(names)), device=env.device)
-        envs = torch.arange(len(tasks), device=env.device)
-        manager.set_task(envs, tasks)
-        env.reset(env_ids=envs)
-        before = torch.stack([env.scene[s].data.root_link_pose_w.torch[envs] for s in slots], 1)  # (E, S, 7)
-        succeeded = torch.zeros(len(tasks), dtype=torch.bool, device=env.device)
-        for _ in range(steps):
-            env.step(hold, auto_reset=False)
-            succeeded |= env.termination_manager.get_term("success")[envs]
-        after = torch.stack([env.scene[s].data.root_link_pose_w.torch[envs] for s in slots], 1)
-        moved = (after[..., :3] - before[..., :3]).norm(dim=-1)
-        # The z axis of a quaternion (x, y, z, w) in the world.
-        x, y, z, w = after[..., 3], after[..., 4], after[..., 5], after[..., 6]
-        up = 1.0 - 2.0 * (x * x + y * y)
-        tilted = up < math.cos(math.radians(20.0))
-        # The hidden stand-ins of empty slots are parked far away.
-        parked = (before[..., 1] - env.scene.env_origins[envs, None, 1]) < -40.0
-        # Objects that start in a container to be taken out settle in it, possibly on their side.
-        inside = torch.zeros_like(parked)
-        for row, task in enumerate(tasks.tolist()):
-            if task in taken_out:
-                inside[row, taken_out[task]] = True
-        unstable = (moved > torch.where(inside, 0.05, 0.03)) | (tilted & ~inside)
-        bad = (unstable | ~torch.isfinite(after).all(dim=-1)) & ~parked
-        for row, task in enumerate(tasks.tolist()):
-            if bad[row].any() or succeeded[row]:
-                failed.append(names[task])
-                report[names[task]] = {
-                    "moved_cm": [round(v * 100, 1) for v in moved[row].tolist()],
-                    "up": [round(v, 2) for v in up[row].tolist()],
-                    "succeeded": bool(succeeded[row]),
+
+@dataclass(frozen=True)
+class Job:
+    """One trial of a task."""
+
+    task: int
+    """Index of the task in the task manager."""
+    task_name: str
+    trial_id: int
+    max_steps: int
+    """Time limit of the task in environment steps."""
+
+
+class JobManager:
+    """Assigns the pending trials with the longest time limits to idle slots and accounts for each trial once."""
+
+    def __init__(self, jobs: list[Job], max_faults: int):
+        self._pending = deque(sorted(jobs, key=lambda job: (-job.max_steps, job.task_name, job.trial_id)))
+        self._expected = len(jobs)
+        self._max_faults = max_faults
+        self._running: dict[int, Job] = {}
+        self._chunks: dict[int, int] = {}
+        self._faults: dict[Job, int] = {}
+        self._completed = 0
+        self._failed: list[dict] = []
+
+    @property
+    def done(self) -> bool:
+        """Whether every trial has completed or failed for good."""
+        return self._completed + len(self._failed) == self._expected
+
+    def acquire(self, slot: int) -> Job | None:
+        """Give the longest pending trial to an idle slot; None when no trial is pending."""
+        if slot in self._running:
+            raise ValueError(f"Slot {slot} still runs a trial.")
+        if not self._pending:
+            return None
+        self._running[slot], self._chunks[slot] = self._pending.popleft(), 0
+        return self._running[slot]
+
+    def complete(self, slot: int) -> None:
+        """Release the slot of a trial that ended in its task's success or time-out."""
+        del self._running[slot], self._chunks[slot]
+        self._completed += 1
+
+    def abandon(self, slot: int) -> str:
+        """Give up a slot's trial after a physics fault: ``requeued`` to run again, or ``failed`` for good.
+
+        A requeued trial repeats the policy keys of its first attempt and keeps the longest-first order, ahead of the
+        pending trials of its length.
+        """
+        job = self._running.pop(slot)
+        del self._chunks[slot]
+        self._faults[job] = self._faults.get(job, 0) + 1
+        if self._faults[job] >= self._max_faults:
+            self._failed.append({**asdict(job), "faults": self._faults[job]})
+            return "failed"
+        order = (i for i, other in enumerate(self._pending) if other.max_steps <= job.max_steps)
+        self._pending.insert(next(order, len(self._pending)), job)
+        return "requeued"
+
+    def request_key(self, slot: int) -> dict:
+        """Return the key of the slot's next policy query, which seeds the server's sampling noise.
+
+        The key names the trial and its query, not the slot, so the answers do not depend on the schedule.
+        """
+        job = self._running[slot]
+        key = {
+            "run_seed": args.seed,
+            "task_name": job.task_name,
+            "episode_idx": job.trial_id,
+            "chunk_idx": self._chunks[slot],
+        }
+        self._chunks[slot] += 1
+        return key
+
+    def snapshot(self) -> dict:
+        """Return the accounting of the trials."""
+        return {
+            "ordering": "longest_max_steps_first",
+            "expected_jobs": self._expected,
+            "pending_jobs": len(self._pending),
+            "running_jobs": len(self._running),
+            "completed_jobs": self._completed,
+            "failed": self._failed,
+            "faults": [
+                {"task_name": job.task_name, "trial_id": job.trial_id, "faults": count}
+                for job, count in self._faults.items()
+            ],
+        }
+
+
+@dataclass
+class Trial:
+    """The trial a slot runs."""
+
+    job: Job
+    steps: int = 0
+    """Steps of the current attempt."""
+    discarded_steps: int = 0
+    """Steps of attempts that ended within two steps, and of waiting for their restarts."""
+    early_reset_count: int = 0
+    restarting: bool = False
+    """Whether the attempt ended within two steps and the slot waits for its restart."""
+
+
+class Timing:
+    """Wall-clock time of the phases of the rollout [s]. GPU work is not synchronized."""
+
+    def __init__(self):
+        self._samples: dict[str, list[float]] = {}
+
+    @contextmanager
+    def measure(self, name: str):
+        """Time a scope."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._samples.setdefault(name, []).append(time.perf_counter() - started)
+
+    def clear(self) -> None:
+        """Discard the measurements."""
+        self._samples.clear()
+
+    def summary(self) -> dict:
+        """Return the count and the distribution of every phase."""
+        return {
+            name: {
+                "count": len(samples),
+                "total_s": sum(samples),
+                "mean_s": statistics.fmean(samples),
+                "p50_s": statistics.median(samples),
+                "max_s": max(samples),
+            }
+            for name, samples in sorted(self._samples.items())
+        }
+
+
+def resize_with_pad(image: np.ndarray, size: int) -> np.ndarray:
+    """Fit an image into a black ``size`` x ``size`` square without distortion, as openpi's client does (bilinear)."""
+    picture = Image.fromarray(image)
+    ratio = max(picture.width / size, picture.height / size)
+    resized = picture.resize((int(picture.width / ratio), int(picture.height / ratio)), resample=Image.BILINEAR)
+    square = Image.new(picture.mode, (size, size), 0)
+    square.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
+    return np.asarray(square)
+
+
+def pack_array(obj):
+    """msgpack hook for NumPy arrays and scalars: openpi's wire format."""
+    if isinstance(obj, np.ndarray):
+        return {b"__ndarray__": True, b"data": obj.tobytes(), b"dtype": obj.dtype.str, b"shape": obj.shape}
+    if isinstance(obj, np.generic):
+        return {b"__npgeneric__": True, b"data": obj.item(), b"dtype": obj.dtype.str}
+    return obj
+
+
+def unpack_array(obj: dict):
+    """The inverse of :func:`pack_array`."""
+    if b"__ndarray__" in obj:
+        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]), shape=obj[b"shape"])
+    if b"__npgeneric__" in obj:
+        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+    return obj
+
+
+class Policy:
+    """The pi0.5 policy that RoboLab's ``policy_server.py`` serves, queried for several slots in one request."""
+
+    def __init__(self, address: str, env, timing: Timing):
+        import msgpack
+        import websockets.sync.client
+
+        self._msgpack = msgpack
+        host, port = address.rsplit(":", 1)
+        # Timeouts make a silent server fail the run instead of hanging it.
+        self._socket = websockets.sync.client.connect(
+            f"ws://{host}:{port}", compression=None, max_size=None, open_timeout=60
+        )
+        self.metadata = msgpack.unpackb(self._socket.recv(timeout=180), object_hook=unpack_array)
+        self._device, self._timing = env.device, timing
+
+    def close(self) -> None:
+        """Close the connection to the server."""
+        self._socket.close()
+
+    def __call__(self, obs: dict, slots: list[int], keys: list[dict], instructions: list[str]) -> torch.Tensor:
+        """Return the arm joint targets and gripper commands (1 closes, 0 opens) of the next ``--horizon`` steps.
+
+        Args:
+            obs: The environment's observations.
+            slots: The slots to query.
+            keys: The key of each slot's query (see :meth:`JobManager.request_key`).
+            instructions: The instruction of each slot's task.
+
+        Returns:
+            The actions of the slots, shape (len(slots), horizon, 8).
+        """
+        with self._timing.measure("observation_readback"):
+            policy = obs["policy"]
+            images = [policy[name][slots].cpu().numpy() for name in CAMERAS]
+            arm = policy["arm_joint_pos"][slots].cpu().numpy().astype(np.float32)
+            gripper = policy["gripper_pos"][slots].cpu().numpy().astype(np.float32)
+            requests = [
+                {
+                    "observation/exterior_image_1_left": resize_with_pad(images[0][row], POLICY_IMAGE),
+                    "observation/wrist_image_left": resize_with_pad(images[1][row], POLICY_IMAGE),
+                    "observation/joint_position": arm[row],
+                    "observation/gripper_position": gripper[row],
+                    "prompt": instructions[row],
+                    "benchmark_key": keys[row],
+                    "benchmark_group": "validate",
                 }
-        print(f"tasks {start}-{start + len(tasks) - 1}: {int((bad.any(1) | succeeded).sum())} failed", flush=True)
-    with open(args.output, "w", encoding="utf-8") as file:
-        json.dump({"failed": failed, "details": report}, file, indent=1)
-    print("FAILED", len(failed), failed, flush=True)
-    env.close()
+                for row in range(len(slots))
+            ]
+        with self._timing.measure("policy_rpc"):
+            self._socket.send(self._msgpack.packb({"robolab_batch": requests}, default=pack_array))
+            reply = self._socket.recv(timeout=600)
+        if isinstance(reply, str):  # the server reports an exception as text
+            raise RuntimeError(f"policy server: {reply}")
+        actions = np.asarray(self._msgpack.unpackb(reply, object_hook=unpack_array)["actions"], dtype=np.float32)
+        if (
+            actions.ndim != 3
+            or actions.shape[0] != len(slots)
+            or actions.shape[1] < args.horizon
+            or actions.shape[2] != 8
+            or not np.isfinite(actions).all()
+        ):
+            raise ValueError(f"policy server returned actions of shape {actions.shape}")
+        actions = torch.as_tensor(actions[:, : args.horizon], device=self._device)
+        actions[..., 7] = (actions[..., 7] > 0.5).float()
+        return actions
+
+
+def rollout(
+    env, policy: Policy, manager: JobManager, timing: Timing, obs: dict, report: dict, episodes_stream, save
+) -> None:
+    """Run every trial on the slots; the module docstring describes the schedule.
+
+    Args:
+        env: The heterogeneous VLA environment.
+        policy: The policy.
+        manager: The trials.
+        timing: The time of the phases.
+        obs: The environment's observations at its start state.
+        report: The report, to which the finished trials and the accounting are added.
+        episodes_stream: File that gets one line per finished trial.
+        save: Function that saves the report.
+    """
+    terminations, task_manager = env.termination_manager, env.task_manager
+    instructions = [task.instruction for task in env.cfg.tasks.values()]
+    # Slots without a trial hold the start pose with the gripper open.
+    actions = torch.cat((obs["policy"]["arm_joint_pos"], obs["policy"]["gripper_pos"].round()), dim=1)
+    active: dict[int, Trial] = {}
+    # Trials of idle slots, which start at the next query.
+    deferred: dict[int, Job] = {}
+    started = last_save = time.perf_counter()
+
+    def release(slot: int) -> None:
+        """Free a slot whose trial ended, and give it the next pending trial."""
+        del active[slot]
+        job = manager.acquire(slot)
+        if job is not None:
+            deferred[slot] = job
+
+    def step() -> dict:
+        """Step the environments with the current actions and settle the trials that ended."""
+        nonlocal last_save
+        if report["control_steps"] >= args.max_steps:
+            raise TimeoutError(f"The rollout exceeded {args.max_steps} environment steps.")
+        report["occupied_env_steps"] += len(active)
+        # The environment's gripper action closes below zero.
+        with timing.measure("env_step"):
+            obs, *_ = env.step(torch.cat((actions[:, :7], 0.5 - actions[:, 7:8]), dim=1), auto_reset=False)
+        report["control_steps"] += 1
+        faulted = terminations.get_term("physics_fault")
+        fault, success = faulted.tolist(), terminations.get_term("success").tolist()
+        timeout = terminations.get_term("time_out").tolist()
+        for slot, trial in list(active.items()):
+            if trial.restarting:
+                trial.discarded_steps += 1
+                continue
+            trial.steps += 1
+            identity = {"task_name": trial.job.task_name, "trial_id": trial.job.trial_id, "env_id": slot}
+            if fault[slot]:
+                consumed = trial.steps + trial.discarded_steps
+                record = {
+                    **identity,
+                    "fault": "physics",
+                    "outcome": manager.abandon(slot),
+                    "consumed_env_steps": consumed,
+                    "shared_control_step": report["control_steps"],
+                }
+                report["slot_faults"].append(record)
+                report["faulted_env_steps"] += consumed
+                release(slot)
+                print(f"{trial.job.task_name} trial {trial.job.trial_id}: physics fault, {record['outcome']}")
+            elif success[slot] or timeout[slot]:
+                if trial.steps <= 2:
+                    trial.early_reset_count += 1
+                    trial.discarded_steps += trial.steps
+                    trial.restarting = True
+                    continue
+                record = {
+                    **identity,
+                    "success": success[slot],
+                    "timeout": timeout[slot],
+                    "steps": trial.steps,
+                    "early_reset_count": trial.early_reset_count,
+                    "discarded_steps": trial.discarded_steps,
+                    "shared_control_step": report["control_steps"],
+                }
+                manager.complete(slot)
+                report["episodes"].append(record)
+                episodes_stream.write(json.dumps(record) + "\n")
+                episodes_stream.flush()
+                release(slot)
+                print(
+                    f"{trial.job.task_name} trial {trial.job.trial_id}: {'success' if success[slot] else 'timeout'}"
+                    f" after {trial.steps} steps ({len(report['episodes'])} trials,"
+                    f" {time.perf_counter() - started:.0f} s)",
+                    flush=True,
+                )
+        if any(fault):
+            # A faulted slot is reset at once, which restores a valid state.
+            with timing.measure("reset"):
+                obs, _ = env.reset(env_ids=faulted.nonzero().squeeze(-1))
+        report["rollout_seconds"] = time.perf_counter() - started
+        if time.perf_counter() - last_save > 10.0:
+            save()
+            last_save = time.perf_counter()
+        return obs
+
+    while not manager.done:
+        # Idle slots take pending trials: the first ones, and those requeued after a fault.
+        for slot in range(env.num_envs):
+            if slot not in active and slot not in deferred:
+                job = manager.acquire(slot)
+                if job is None:
+                    break
+                deferred[slot] = job
+        # At the round barrier the next trials start: their slots get their tasks and are reset, as are the slots
+        # whose trials restart.
+        restarting = [slot for slot, trial in active.items() if trial.restarting]
+        if deferred:
+            slots = sorted(deferred)
+            tasks = torch.tensor([deferred[slot].task for slot in slots], device=env.device)
+            report["scene_switches"] += int((task_manager.task_ids[slots] != tasks).sum())
+            with timing.measure("task_switch"):
+                task_manager.set_task(slots, tasks)
+        if deferred or restarting:
+            with timing.measure("reset"):
+                obs, _ = env.reset(env_ids=torch.tensor(sorted({*deferred, *restarting}), device=env.device))
+            for slot in restarting:
+                active[slot].restarting, active[slot].steps = False, 0
+            active.update({slot: Trial(job) for slot, job in deferred.items()})
+            deferred.clear()
+        if not active:
+            raise AssertionError("Unfinished trials without a slot.")
+        # One query for all slots that run a trial.
+        slots = sorted(active)
+        keys = [manager.request_key(slot) for slot in slots]
+        chunks = policy(obs, slots, keys, [instructions[active[slot].job.task] for slot in slots])
+        rows = {slot: row for row, slot in enumerate(slots)}
+        report["inference_rounds"] += 1
+        report["batch_histogram"][str(len(slots))] = report["batch_histogram"].get(str(len(slots)), 0) + 1
+        if env.device.startswith("cuda"):
+            free, total = torch.cuda.mem_get_info(env.device)
+            report["gpu_used_mib_peak"] = max(report.get("gpu_used_mib_peak", 0), round((total - free) / 2**20))
+        for offset in range(args.horizon):
+            if not active:
+                break
+            # A slot whose trial ended holds its last targets until the next query.
+            running = sorted(active)
+            actions[running] = chunks[[rows[slot] for slot in running], offset]
+            obs = step()
+
+
+def finalize(report: dict, names: list[str]) -> None:
+    """Check that every step of a slot with a trial is accounted for, and record the results of the tasks."""
+    accounted = sum(episode["steps"] + episode["discarded_steps"] for episode in report["episodes"])
+    accounted += report["faulted_env_steps"]
+    if accounted != report["occupied_env_steps"]:
+        raise AssertionError(f"Unaccounted environment steps: {accounted} != {report['occupied_env_steps']}")
+    report["slot_utilization"] = accounted / max(args.num_envs * report["control_steps"], 1)
+    report["slot_fault_count"] = len(report["slot_faults"])
+    episodes = Counter(episode["task_name"] for episode in report["episodes"])
+    successes = Counter(episode["task_name"] for episode in report["episodes"] if episode["success"])
+    report["task_results"] = [
+        {"task_name": name, "episodes": episodes[name], "successes": successes[name]} for name in names
+    ]
+    report["successes"] = sum(successes.values())
+    report["success_rate"] = report["successes"] / max(len(report["episodes"]), 1)
+    report.update(phase="complete", passed=True)
+
+
+def main() -> None:
+    """Build the environment, run the trials and write the report."""
+    env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
+    task_names = list(env_cfg.tasks)
+    if unknown := [name for name in args.tasks or () if name not in task_names]:
+        parser.error(f"unknown tasks: {unknown}")
+    task_ids = [task_names.index(name) for name in args.tasks] if args.tasks else list(range(len(task_names)))
+    if args.num_envs > len(task_ids) * args.trials:
+        parser.error("--num_envs must not exceed the number of trials")
+    if args.mesh_cache_dir:
+        newton.config.cache_dir_meshes = args.mesh_cache_dir
+    # The policy observes once per chunk, so the cameras render once per chunk: due a little before its last step,
+    # as the sensor clocks add up float32 step times.
+    for camera in (env_cfg.scene.over_shoulder_left_camera, env_cfg.scene.wrist_cam):
+        camera.update_period = (args.horizon - 0.5) * env_cfg.decimation * env_cfg.sim.dt
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+
+    timing, manager, env, policy = Timing(), None, None, None
+    report = {
+        "passed": False,
+        "phase": "scene_initialization",
+        "arguments": {key: str(value) for key, value in vars(args).items()},
+        "num_slots": args.num_envs,
+        "episodes_per_task": args.trials,
+        "task_count": len(task_ids),
+        "expected_episodes": len(task_ids) * args.trials,
+        "run_seed": args.seed,
+        "episodes": [],
+        "control_steps": 0,
+        "occupied_env_steps": 0,
+        "inference_rounds": 0,
+        "batch_histogram": {},
+        "scene_switches": 0,
+        "slot_faults": [],
+        "faulted_env_steps": 0,
+    }
+    started = time.perf_counter()
+
+    def save() -> None:
+        """Write the report, replacing the last one at once."""
+        report["wall_seconds"] = time.perf_counter() - started
+        report["timing"] = timing.summary()
+        if manager is not None:
+            report["schedule"] = manager.snapshot()
+        temporary = output / "result.json.tmp"
+        temporary.write_text(json.dumps(report, indent=1, default=str))
+        temporary.replace(output / "result.json")
+
+    try:
+        with launch_simulation(env_cfg, args):
+            try:
+                env = gym.make(args.task, cfg=env_cfg).unwrapped
+                report["scene_initialization_seconds"] = time.perf_counter() - started
+                limits = env.task_manager.max_episode_length.tolist()
+                manager = JobManager(
+                    [
+                        Job(task, task_names[task], trial, limits[task])
+                        for task in task_ids
+                        for trial in range(args.trials)
+                    ],
+                    args.max_faults,
+                )
+                policy = Policy(args.policy, env, timing)
+                print(f"policy server at {args.policy}: {policy.metadata}", flush=True)
+                report.update(phase="warmup", policy_server=policy.metadata)
+                save()
+                # The first render and the first query warm up the renderer and the policy; the rollout excludes them.
+                warmup_started = time.perf_counter()
+                obs, _ = env.reset()
+                warmup_key = {"run_seed": args.seed, "task_name": "warmup", "episode_idx": 0, "chunk_idx": 0}
+                policy(obs, [0], [warmup_key], [env_cfg.tasks[task_names[0]].instruction])
+                report["warmup_seconds"] = time.perf_counter() - warmup_started
+                timing.clear()
+                report["phase"] = "running"
+                with (output / "episodes.jsonl").open("w") as episodes_stream:
+                    rollout(env, policy, manager, timing, obs, report, episodes_stream, save)
+                finalize(report, [task_names[task] for task in task_ids])
+                print(
+                    f"SUCCESS {report['successes']}/{len(report['episodes'])} ({report['success_rate']:.1%}),"
+                    f" {report['slot_fault_count']} physics faults, {report['rollout_seconds']:.0f} s",
+                    flush=True,
+                )
+            finally:
+                if policy is not None:
+                    policy.close()
+                if env is not None:
+                    env.close()
+    except BaseException as error:
+        report.update(phase="failed", error=repr(error), traceback=traceback.format_exc())
+        raise
+    finally:
+        save()
+
+
+if __name__ == "__main__":
+    main()
