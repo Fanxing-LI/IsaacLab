@@ -281,6 +281,7 @@ class RerunVisualizer(BaseVisualizer):
             except Exception:
                 logger.info("[RerunVisualizer] Could not auto-open browser tab. Open manually: %s", viewer_url)
         self._viewer.set_model(self.backend.model)
+        self._variants_version = self.backend.variants_version
         self._viewer.show_particles = self.cfg.backend.show_particles
         self._viewer.set_visible_worlds(self._env_ids)
         # Preserve simulation world positions (env_spacing) rather than adding viewer-side offsets.
@@ -333,7 +334,11 @@ class RerunVisualizer(BaseVisualizer):
         if not self._viewer.is_paused():
             backend, provider = self.backend, self._sim.get_scene_data_provider()
             poses = SceneDataFormat.Transform()
-            if provider.get_transforms(poses, mapping=self._transform_mapping, count=backend.model.body_count):
+            # Only a render-only backend takes the published poses; a simulation backend owns them.
+            if (
+                provider.get_transforms(poses, mapping=self._transform_mapping, count=backend.model.body_count)
+                and backend.cfg is None
+            ):
                 backend.state_0.body_q = poses.transforms
             if backend.geometry_offsets:
                 provider.get_geometry_points(output=backend.state_0.particle_q, offsets=backend.geometry_offsets)
@@ -342,6 +347,7 @@ class RerunVisualizer(BaseVisualizer):
                 # Empty body arrays skip log_state, but streaming still runs after end_frame.
                 body_q = backend.state_0.body_q
                 if body_q is None or body_q.shape[0]:
+                    self._variants_version = backend.notify_viewer(self._viewer, self._variants_version)
                     self._viewer.log_state(backend.state_0)
                     if self.cfg.enable_markers:
                         render_newton_visualization_markers(self._viewer, self._env_ids, num_envs=num_envs)
@@ -365,6 +371,7 @@ class RerunVisualizer(BaseVisualizer):
         self.backend = backend
         self._transform_mapping = self._sim.get_scene_data_provider().create_mapping(list(backend.model.body_label))
         self._viewer.set_model(backend.model)
+        self._variants_version = backend.variants_version
         self._viewer.set_visible_worlds(self._env_ids)
         self._viewer.set_world_offsets((0.0, 0.0, 0.0))
 

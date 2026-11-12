@@ -323,6 +323,7 @@ class ViserVisualizer(BaseVisualizer):
             print()
             self._log_viewer_url("ViserVisualizer", viewer_url)
         self._viewer.set_model(self.backend.model)
+        self._variants_version = self.backend.variants_version
         self._viewer.show_particles = self.cfg.backend.show_particles
         # set_model() clears model-dependent GUI elements; build the sidebar afterwards.
         self._setup_isaaclab_sidebar(self._viewer._server)
@@ -384,10 +385,15 @@ class ViserVisualizer(BaseVisualizer):
             if not self.cfg.streaming_view:
                 backend, provider = self.backend, self._sim.get_scene_data_provider()
                 poses = SceneDataFormat.Transform()
-                if provider.get_transforms(poses, mapping=self._transform_mapping, count=backend.model.body_count):
+                # Only a render-only backend takes the published poses; a simulation backend owns them.
+                if (
+                    provider.get_transforms(poses, mapping=self._transform_mapping, count=backend.model.body_count)
+                    and backend.cfg is None
+                ):
                     backend.state_0.body_q = poses.transforms
                 if backend.geometry_offsets:
                     provider.get_geometry_points(output=backend.state_0.particle_q, offsets=backend.geometry_offsets)
+                self._variants_version = backend.notify_viewer(self._viewer, self._variants_version)
                 self._viewer.log_state(self.backend.state_0)
                 if self.cfg.enable_markers:
                     self._render_markers(self.backend.model.num_envs)
@@ -431,6 +437,7 @@ class ViserVisualizer(BaseVisualizer):
         self.backend = backend
         self._transform_mapping = self._sim.get_scene_data_provider().create_mapping(list(backend.model.body_label))
         self._viewer.set_model(backend.model)
+        self._variants_version = backend.variants_version
         self._setup_isaaclab_sidebar(self._viewer._server)
         self._viewer.set_visible_worlds(self._env_ids)
         self._viewer.set_world_offsets((0.0, 0.0, 0.0))
