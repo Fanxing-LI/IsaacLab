@@ -43,6 +43,10 @@ _SKIPPED_TASK_SUBSTRINGS = {
 _COVERED_TASKS = [
     "IsaacContrib-Lift-Cube-Franka",  # Already covered by test_environment_determinism.py
 ]
+_COVERED_TASK_PREFIXES = (
+    # The VLA tasks download their assets from Hugging Face; the manager and success terms have their own tests.
+    "IsaacContrib-VLA-",
+)
 
 
 def _skip_reason(task_name: str) -> str | None:
@@ -86,7 +90,8 @@ def contrib_environment_params(runtime: Runtime) -> list:
     """
     tasks_by_family: dict[tuple[str, str, Runtime], list[str]] = defaultdict(list)
     task_marks = {}
-    for task_param in setup_environment(multi_agent=False, tier="contrib", exclude_task_names=_COVERED_TASKS):
+    covered = [*_COVERED_TASKS, *(name for name in gym.registry if name.startswith(_COVERED_TASK_PREFIXES))]
+    for task_param in setup_environment(multi_agent=False, tier="contrib", exclude_task_names=covered):
         task_name = getattr(task_param, "values", (task_param,))[0]
         task_marks[task_name] = getattr(task_param, "marks", ())
         tasks_by_family[(*_variant_family(task_name), task_runtime(task_name))].append(task_name)
