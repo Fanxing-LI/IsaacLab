@@ -14,7 +14,7 @@ Issue 1, slow scene initialization. OVRTX either clones the scene itself (``nati
 ``ISAAC_LAB_OVRTX_USE_OVSTAGE=0``) or renders an independent OVStage (``ovstage``, ``=1``, which this branch selects
 for scenes with switchable assets). The script measures each scene in its own process: the time of creating the
 environment up to its first images, most of which is the first native submission (a call of
-``ovrtx.Renderer.step``), and the time of the later renders, where ``ovstage`` commits the stage on every submission.
+``ovrtx.Renderer.step``).
 
 Issue 2, repeated renders of lazy camera reads. A camera renders when its data is read. Isaac Lab submits every
 render product on each native submission (``OVRTXRenderer.render_batch``, isaac-sim/IsaacLab#8116), because OVRTX
@@ -22,7 +22,8 @@ takes far longer for a render product that was left out of the submission before
 renders all cameras, and reading every camera renders every camera once per camera. The pose of a camera that
 follows a body (``wrist_cam``) reaches OVRTX only at that camera's own read, so a submission that is requested for
 another camera renders it at the pose of its last read. Isaac Lab leaves these images unread. The script measures
-three kinds of camera reads:
+three kinds of camera reads, each by the time of one submission and by the render time of an environment step (its
+submissions and its writes of the camera poses and the object transforms):
 
 * ``batched``: the work-around of this branch, ``Camera._update_outdated_buffers``, which reads all due cameras in
   one submission.
@@ -134,20 +135,18 @@ class Probe:
         """Wrap the calls of the OVRTX renderer, whose modules load once the launcher has registered OVRTX."""
         import ovrtx
         from isaaclab_ov.renderers.ovrtx_renderer import OVRTXRenderer
-        from isaaclab_ov.stage import OvstageBackend
 
-        def timed(owner: type, method: str, name: str) -> None:
-            original = getattr(owner, method)
+        def timed(method: str, name: str) -> None:
+            original = getattr(OVRTXRenderer, method)
 
             def wrapper(*positional, **keywords):
                 with self._timed(name):
                     return original(*positional, **keywords)
 
-            setattr(owner, method, wrapper)
+            setattr(OVRTXRenderer, method, wrapper)
 
-        timed(OVRTXRenderer, "prepare_stage", "prepare_stage")
-        timed(OVRTXRenderer, "update_transforms", "transform_write")
-        timed(OvstageBackend, "commit", "stage_commit")
+        timed("prepare_stage", "prepare_stage")
+        timed("update_transforms", "transform_write")
 
         update_camera = OVRTXRenderer.update_camera
 
@@ -201,9 +200,8 @@ class Probe:
 
         process_render_products = OVRTXRenderer._process_render_products
 
-        def timed_process_render_products(renderer, render_data, products):
-            with self._timed("read_back"):
-                process_render_products(renderer, render_data, products)
+        def process_unread_render_products(renderer, render_data, products):
+            process_render_products(renderer, render_data, products)
             if not self.keep_unread:
                 return
             # The renderer reads back only the requested products. Read the others into buffers of their own.
@@ -222,7 +220,7 @@ class Probe:
                 wp.synchronize()
                 self.unread[path] = (wp.to_torch(buffers["rgba"])[..., :3].clone(), self.poses.get(path))
 
-        OVRTXRenderer._process_render_products = timed_process_render_products
+        OVRTXRenderer._process_render_products = process_unread_render_products
 
     def take(self) -> dict:
         """Return the durations and submissions recorded since the last take, and forget them."""
@@ -261,7 +259,7 @@ def time_steps(env, probe: Probe, actions, steps: int) -> dict:
 
     Returns:
         The time of an environment step and of its renders [ms], the native submissions per step, the cameras a
-        submission is requested for and renders, and the times of the calls of a submission [ms].
+        submission is requested for and renders, and the time of the render of a submission [ms].
     """
     for _ in range(WARMUP_STEPS):
         env.step(next(actions), auto_reset=False)
@@ -277,25 +275,18 @@ def time_steps(env, probe: Probe, actions, steps: int) -> dict:
     def per_step(name: str) -> list[float]:
         return [sum(step["seconds"].get(name, ())) for step in taken]
 
-    def per_call(name: str) -> float | None:
-        calls = [seconds for step in taken for seconds in step["seconds"].get(name, ())]
-        return 1e3 * statistics.median(calls) if calls else None
-
     submissions = [call for step in taken for call in step["submissions"]]
     render = [
         sum(parts) for parts in zip(per_step("pose_write"), per_step("transform_write"), per_step("render_batch"))
     ]
+    render_batch = [seconds for step in taken for seconds in step["seconds"]["render_batch"]]
     return {
         "env_step_ms": 1e3 * statistics.median(step["env_step"] for step in taken),
         "render_ms_per_env_step": 1e3 * statistics.median(render),
-        "transform_write_ms_per_env_step": 1e3 * statistics.median(per_step("transform_write")),
         "submissions_per_env_step": len(submissions) / steps,
         "cameras_requested_per_submission": statistics.fmean(len(call["requested"]) for call in submissions),
         "cameras_rendered_per_submission": statistics.fmean(len(call["rendered"]) for call in submissions),
-        "render_batch_ms": per_call("render_batch"),
-        "native_step_ms": per_call("native_step"),
-        "stage_commit_ms": per_call("stage_commit"),
-        "read_back_ms": per_call("read_back"),
+        "render_batch_ms": 1e3 * statistics.median(render_batch),
     }
 
 
@@ -368,11 +359,6 @@ def report(results: dict[str, dict]) -> str:
         ("  native submissions of the first images [s]", lambda r: r["initialization"]["submissions_s"]),
         ("assignment of the tasks and reset [s]", lambda r: r["task_assignment_s"]),
         ("peak host memory [GiB]", lambda r: r["peak_rss_mib"] / 1024.0),
-        ("render of all cameras in one submission [ms]", lambda r: r["batched"]["render_batch_ms"]),
-        ("  native Renderer.step [ms]", lambda r: r["batched"]["native_step_ms"]),
-        ("  stage commit [ms]", lambda r: r["batched"]["stage_commit_ms"]),
-        ("  read-back of the images [ms]", lambda r: r["batched"]["read_back_ms"]),
-        ("write of the object transforms per step [ms]", lambda r: r["batched"]["transform_write_ms_per_env_step"]),
         ("Issue 2: repeated renders of lazy camera reads", None),
     ]
     for reads, title in READS.items():
